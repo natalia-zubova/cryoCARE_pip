@@ -118,7 +118,8 @@ class CryoCARE(CARE):
                 slices += (slice(0, -(data_shape[i]%div_by[i])),)
         return data[slices]
 
-    def _predict_mean_and_scale(self, even, odd, output, axes, normalizer, resizer, mean, std, n_tiles=None):
+    def _predict_mean_and_scale(self, even, odd, output, axes, normalizer, resizer, mean, std, n_tiles=None,
+                                even_out=None, odd_out=None):
         """Apply neural network to raw image to predict restored image.
 
         See :func:`predict` for parameter explanations.
@@ -211,12 +212,30 @@ class CryoCARE(CARE):
         while not done:
             try:
                 # raise tf.errors.ResourceExhaustedError(None,None,None) # tmp
-                pred = predict_tiled(self.keras_model, even, odd, output, [4 * (slice(None),)], 4 * (slice(None),),
-                                     mean=mean, std=std,
-                                     axes_in=net_axes_in, axes_out=net_axes_out,
-                                     n_tiles=n_tiles, block_sizes=net_axes_in_div_by,
-                                     tile_overlaps=net_axes_in_overlaps, pbar=progress)
-                output = pred
+                # Request tiled prediction; optionally receive per-input component predictions
+                if even_out is None and odd_out is None:
+                    pred = predict_tiled(self.keras_model, even, odd, output, [4 * (slice(None),)], 4 * (slice(None),),
+                                          mean=mean, std=std,
+                                          axes_in=net_axes_in, axes_out=net_axes_out,
+                                          n_tiles=n_tiles, block_sizes=net_axes_in_div_by,
+                                          tile_overlaps=net_axes_in_overlaps, pbar=progress)
+                    output = pred
+                else:
+                    pred, even_pred, odd_pred = predict_tiled(self.keras_model, even, odd, output,
+                                                               [4 * (slice(None),)], 4 * (slice(None),),
+                                                               mean=mean, std=std,
+                                                               axes_in=net_axes_in, axes_out=net_axes_out,
+                                                               n_tiles=n_tiles, block_sizes=net_axes_in_div_by,
+                                                               tile_overlaps=net_axes_in_overlaps, pbar=progress,
+                                                               return_components=True)
+                    output = pred
+                    try:
+                        # try to write components into provided arrays/views
+                        even_out[:] = even_pred[:]
+                        odd_out[:] = odd_pred[:]
+                    except Exception:
+                        # if direct assignment fails, proceed without raising here
+                        pass
                 # x has net_axes_out semantics
                 done = True
                 progress.close()
@@ -245,19 +264,26 @@ class CryoCARE(CARE):
 
 def predict_tiled(keras_model, even, odd, output, s_src_out, s_dst_out, mean, std, n_tiles, block_sizes, tile_overlaps,
                   axes_in,
-                  axes_out=None, pbar=None, **kwargs):
+                  axes_out=None, pbar=None, return_components=False, **kwargs):
     """TODO."""
     if all(t == 1 for t in n_tiles):
         even_pred = predict_direct(keras_model, even, mean, std, axes_in, axes_out, **kwargs)
         odd_pred = predict_direct(keras_model, odd, mean, std, axes_in, axes_out, **kwargs)
         pred = (even_pred + odd_pred) / 2.
+        # apply source selectors to all component arrays
         for src in s_src_out:
             pred = pred[src]
+            even_pred = even_pred[src]
+            odd_pred = odd_pred[src]
+
         if pbar is not None:
             pbar.update()
 
         if output.shape == pred.shape:
             output[:] = pred[:]
+
+        if return_components:
+            return pred, even_pred, odd_pred
 
         return pred
 
@@ -303,6 +329,11 @@ def predict_tiled(keras_model, even, odd, output, s_src_out, s_dst_out, mean, st
     n_tiles_remaining = list(n_tiles)
     n_tiles_remaining[axis] = 1
 
+    # if requested, prepare containers to assemble component predictions across tiles
+    if return_components:
+        even_assembled = np.zeros_like(output)
+        odd_assembled = np.zeros_like(output)
+
     for ((even_tile, s_src, s_dst), (odd_tile, _, _), (output_tile, _, _)) in zip(
             tile_iterator_1d(even, axis=axis, n_tiles=n_tiles[axis], block_size=block_size,
                              n_block_overlap=n_block_overlap),
@@ -310,12 +341,23 @@ def predict_tiled(keras_model, even, odd, output, s_src_out, s_dst_out, mean, st
                              n_block_overlap=n_block_overlap),
             tile_iterator_1d(output, axis=axis, n_tiles=n_tiles[axis], block_size=block_size,
                              n_block_overlap=n_block_overlap)):
-        pred = predict_tiled(keras_model, even_tile, odd_tile, output_tile[s_src_out[-1]], s_src_out + [s_src], s_dst,
-                             mean, std, n_tiles_remaining, block_sizes, tile_overlaps, axes_in, axes_out, pbar=pbar,
-                             **kwargs)
+        res = predict_tiled(keras_model, even_tile, odd_tile, output_tile[s_src_out[-1]], s_src_out + [s_src], s_dst,
+                             mean, std, n_tiles_remaining, block_sizes, tile_overlaps, axes_in, axes_out,
+                             pbar=pbar, return_components=return_components, **kwargs)
 
         s_dst = _to_axes_out(s_dst, slice(None))
-        output[s_dst][s_src_out[-1]] = pred
+
+        if return_components:
+            pred, even_tile_pred, odd_tile_pred = res
+            output[s_dst][s_src_out[-1]] = pred
+            even_assembled[s_dst][s_src_out[-1]] = even_tile_pred
+            odd_assembled[s_dst][s_src_out[-1]] = odd_tile_pred
+        else:
+            pred = res
+            output[s_dst][s_src_out[-1]] = pred
+
+    if return_components:
+        return output[s_src_out[-1]], even_assembled[s_src_out[-1]], odd_assembled[s_src_out[-1]]
 
     return output[s_src_out[-1]]
 

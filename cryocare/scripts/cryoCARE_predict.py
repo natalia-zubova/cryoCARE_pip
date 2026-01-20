@@ -1,4 +1,4 @@
-#! python
+#!/software/fg24661/miniconda/envs/cryocare_11/bin/python3.8
 import argparse
 import json
 from os.path import join
@@ -14,6 +14,7 @@ from typing import Tuple
 
 from cryocare.internals.CryoCARE import CryoCARE
 from cryocare.internals.CryoCAREDataModule import CryoCARE_DataModule
+from csbdeep.data import NoResizer
 
 import psutil
 
@@ -76,16 +77,77 @@ def denoise(config: dict, mean: float, std: float, even: str, odd: str, output_f
 
     denoised = np.zeros(even_vol.shape)
 
+    # Add channel dimension to arrays (in-place, consistent with original code)
     even_vol.shape += (1,)
     odd_vol.shape += (1,)
     denoised.shape += (1,)
 
-    model.predict(even_vol, odd_vol, denoised, axes='ZYXC', normalizer=None, mean=mean, std=std,
-                  n_tiles=config['n_tiles'] + [1, ])
+    # prepare cropped views for the model (the model expects cropped inputs as in CryoCARE.predict)
+    even_c = model._crop(even_vol)
+    odd_c = model._crop(odd_vol)
+    denoised_c = model._crop(denoised)
 
-    denoised = denoised[slice(0, shape_before_pad[0]), slice(0, shape_before_pad[1]), slice(0, shape_before_pad[2])]
-    mrc = mrcfile.new_mmap(output_file, denoised.shape, mrc_mode=2, overwrite=True)
-    mrc.data[:] = denoised
+    # create containers for even/odd component predictions (cropped views)
+    even_comp = np.zeros_like(denoised)
+    odd_comp = np.zeros_like(denoised)
+    even_comp_c = model._crop(even_comp)
+    odd_comp_c = model._crop(odd_comp)
+
+    # run prediction filling average into denoised_c and components into even_comp_c / odd_comp_c
+    # use NoResizer to match CryoCARE.predict behavior
+    model._predict_mean_and_scale(even_c, odd_c, denoised_c, axes='ZYXC', normalizer=None, resizer=NoResizer(),
+                                  mean=mean, std=std, n_tiles=config['n_tiles'] + [1, ],
+                                  even_out=even_comp_c, odd_out=odd_comp_c)
+
+    # crop padded arrays back to original shape (may still have a singleton channel axis)
+    denoised_final = denoised[slice(0, shape_before_pad[0]), slice(0, shape_before_pad[1]), slice(0, shape_before_pad[2])]
+    even_final = even_comp[slice(0, shape_before_pad[0]), slice(0, shape_before_pad[1]), slice(0, shape_before_pad[2])]
+    odd_final = odd_comp[slice(0, shape_before_pad[0]), slice(0, shape_before_pad[1]), slice(0, shape_before_pad[2])]
+
+    # remove trailing singleton channel axis if present so shapes match the original tomogram
+    def _squeeze_channel_if_needed(arr, target_shape):
+        if arr.shape == target_shape:
+            return arr
+        # if last axis is singleton and squeezing yields target shape, do it
+        if arr.ndim == len(target_shape) + 1 and arr.shape[-1] == 1 and arr[..., 0].shape == target_shape:
+            return arr[..., 0]
+        return arr
+
+    denoised_final = _squeeze_channel_if_needed(denoised_final, shape_before_pad)
+    even_final = _squeeze_channel_if_needed(even_final, shape_before_pad)
+    odd_final = _squeeze_channel_if_needed(odd_final, shape_before_pad)
+
+    # sanity check shapes
+    if denoised_final.shape != shape_before_pad:
+        raise RuntimeError(f"Averaged denoised volume has incorrect shape {denoised_final.shape}, expected {shape_before_pad}")
+    if even_final.shape != shape_before_pad:
+        raise RuntimeError(f"Even denoised volume has incorrect shape {even_final.shape}, expected {shape_before_pad}")
+    if odd_final.shape != shape_before_pad:
+        raise RuntimeError(f"Odd denoised volume has incorrect shape {odd_final.shape}, expected {shape_before_pad}")
+
+    # Verify that (even + odd) / 2 reconstructs the averaged prediction within tolerance
+    avg = denoised_final.astype(np.float64)
+    recon = (even_final.astype(np.float64) + odd_final.astype(np.float64)) / 2.0
+    max_abs = float(np.max(np.abs(avg - recon)))
+    mean_abs = float(np.mean(np.abs(avg - recon)))
+    print(f"Component reconstruction check: max_abs={max_abs:.6e}, mean_abs={mean_abs:.6e}")
+    if not np.allclose(avg, recon, rtol=1e-6, atol=1e-6):
+        raise RuntimeError(f"Even/odd components do not reconstruct averaged output (max_abs={max_abs:.6e}, mean_abs={mean_abs:.6e})")
+
+    # Write averaged volume (same behavior as original)
+    mrc = mrcfile.new_mmap(output_file, denoised_final.shape, mrc_mode=2, overwrite=True)
+    mrc.data[:] = denoised_final
+
+    # Write even and odd volumes to separate files next to averaged output
+    base, ext = os.path.splitext(output_file)
+    even_out_file = base + '_even' + ext
+    odd_out_file = base + '_odd' + ext
+
+    mrc_even = mrcfile.new_mmap(even_out_file, even_final.shape, mrc_mode=2, overwrite=True)
+    mrc_even.data[:] = even_final
+
+    mrc_odd = mrcfile.new_mmap(odd_out_file, odd_final.shape, mrc_mode=2, overwrite=True)
+    mrc_odd.data[:] = odd_final
 
 
 
@@ -103,6 +165,26 @@ def denoise(config: dict, mean: float, std: float, even: str, odd: str, output_f
             mrc.header[l] = even.header[l]
     mrc.header['mode'] = 2
     mrc.set_extended_header(even.extended_header)
+    # copy header for even/odd outputs as well
+    try:
+        for l in even.header.dtype.names:
+            if l == 'label':
+                new_label = np.concatenate((even.header[l][1:-1], np.array([
+                    'cryoCARE                                                ' + datetime.datetime.now().strftime(
+                        "%d-%b-%y  %H:%M:%S") + "     "]),
+                                                np.array([''])))
+                mrc_even.header[l] = new_label
+                mrc_odd.header[l] = new_label
+            else:
+                mrc_even.header[l] = even.header[l]
+                mrc_odd.header[l] = even.header[l]
+        mrc_even.header['mode'] = 2
+        mrc_odd.header['mode'] = 2
+        mrc_even.set_extended_header(even.extended_header)
+        mrc_odd.set_extended_header(even.extended_header)
+    except Exception:
+        # non-fatal: header copy failed
+        pass
 
 def main():
     
