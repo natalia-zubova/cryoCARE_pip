@@ -11,10 +11,11 @@ import numpy as np
 import sys
 import tensorflow as tf
 from typing import Tuple
+from csbdeep.data import NoResizer
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from cryocare.internals.CryoCARE import CryoCARE
 from cryocare.internals.CryoCAREDataModule import CryoCARE_DataModule
-from csbdeep.data import NoResizer
 
 import psutil
 

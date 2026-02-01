@@ -5,9 +5,13 @@ from cryocare.internals.CryoCARE import CryoCARE
 from csbdeep.models import Config
 import pickle
 from os.path import join
+import sys
+import os
+import tensorflow as tf
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from cryocare.internals.CryoCAREDataModule import CryoCARE_DataModule
 from cryocare.scripts.cryoCARE_predict import set_gpu_id
-import tensorflow as tf
 
 def main():
     parser = argparse.ArgumentParser(description='Load training config.')

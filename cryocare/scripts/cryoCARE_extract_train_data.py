@@ -4,8 +4,13 @@ import json
 import warnings
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from cryocare.internals.CryoCAREDataModule import CryoCARE_DataModule
 
+import inspect
+print("CryoCARE_DataModule imported from:", inspect.getfile(CryoCARE_DataModule))
+print("Module file:", CryoCARE_DataModule.__module__)
 
 def custom_formatwarning(msg, *args, **kwargs):
     # ignore everything except the message
